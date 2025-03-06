@@ -8,8 +8,8 @@ anyhow = "1.0.97"
 csv = "1.3.1"
 tokio = { version = "1.43.0" , features = ["rt-multi-thread"]}
 reqwest = "0.12.12"
-#dialoguer = {git = "https://github.com/sirati/dialoguer.git", version = "0.11.5", features = ["tokio"] }
-dialoguer = {path = "../dialoguer", features = ["tokio"] }
+dialoguer = {git = "https://github.com/sirati/dialoguer.git", version = "0.11.5", features = ["tokio"] }
+#dialoguer = {path = "../dialoguer", features = ["tokio"] }
 http-cache-reqwest = "0.15.1"
 reqwest-middleware = "0.4.1"
 scraper = "0.23.1"
