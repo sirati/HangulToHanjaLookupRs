@@ -1,5 +1,6 @@
 #![feature(random)]
 
+use clap::Parser;
 use anyhow::{Result, anyhow};
 use csv::{ReaderBuilder, WriterBuilder};
 use dialoguer::Select;
@@ -23,10 +24,6 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
-const INPUT_FILE: &str = "/home/sirati/Vocab Unit 1 audio only.txt";
-const OUTPUT_FILE: &str = "/home/sirati/Vocab Unit 1 audio only hanja.tsv";
-const COLUMN_HANGUL: usize = 1; // second column
-const COLUMN_ENGLISH: usize = 2; // third column
 
 macro_rules! aprintln {
     ($dst:expr, $($arg:tt)*) => {
@@ -97,7 +94,7 @@ struct UserInteraction {
 }
 
 /// Reads a TSV file (skipping lines starting with '#') and returns rows.
-fn read_tsv_file<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<String>>> {
+fn read_tsv_file<P: AsRef<Path>>(path: P, min_columns_required: usize) -> Result<Vec<Vec<String>>> {
     let file = File::open(path)?;
     let mut rdr = ReaderBuilder::new()
         .delimiter(b'\t')
@@ -106,7 +103,7 @@ fn read_tsv_file<P: AsRef<Path>>(path: P) -> Result<Vec<Vec<String>>> {
     let mut rows = Vec::new();
     for result in rdr.records() {
         let record = result?;
-        if record.len() >= (COLUMN_HANGUL.max(COLUMN_ENGLISH) + 1) {
+        if record.len() >= min_columns_required {
             rows.push(record.iter().map(|s| s.to_string()).collect());
         }
     }
@@ -389,8 +386,8 @@ async fn prompt_user(
     eng_word: String,
     options: Vec<(String, String)>,
 ) -> Option<String> {
-    aprintln!(
-        "\nMultiple options for hangul: {} and english: {}",
+    let prompt = format!(
+        "\nMultiple options for hangul: {} and english: {}\nSelect an option",
         hangul,
         eng_word
     );
@@ -400,7 +397,7 @@ async fn prompt_user(
     }
 
     let selection = Select::new()
-        .with_prompt("Select an option")
+        .with_prompt(prompt)
         .items(&items)
         .default(0)
         .interact_on_async(term)
@@ -414,6 +411,36 @@ async fn prompt_user(
     }
 }
 
+fn merge_hanja_hangul(hanja: impl Into<String>, hangul: impl Into<String>) -> String {
+    let hanja = hanja.into();
+    if hanja.is_empty() {
+        return hanja;
+    }
+    let hanja_nodash_trimmed: String = hanja.chars().filter(|c| *c != '-').collect::<String>().trim().to_string();
+    let hangul = hangul.into();
+    let hangul = hangul.trim();
+
+    let hanja_trimmed = hanja.trim();
+    let hanja_len = hanja_nodash_trimmed.chars().count();
+    let hangul_len = hangul.chars().count();
+    if hanja_len == hangul_len {
+        return hanja;
+    }
+
+    if hanja_trimmed.starts_with('-') {
+        aprintln!("{}: Hanja starts with dash, trimming: {}", hangul, hanja_trimmed);
+        let prefix: String = hangul.chars().take(hangul_len - hanja_len).collect();
+        format!("{}{}", prefix, hanja_nodash_trimmed)
+    } else if hanja.find('-').map_or(true, |i| hanja[i..].trim_matches(['-', ' '].as_ref()).is_empty()) {
+        aprintln!("{}: appending at end because got: '{}' with {:?}", hangul, hanja, hanja.find('-'));
+        let remaining: String = hangul.chars().skip(hanja_len).collect();
+        format!("{}{}", hanja_nodash_trimmed, remaining)
+    } else {
+        aprintln!("{}: skipping adding hangul because got: '{}' with {:?}", hangul, hanja, hanja.find('-'));
+        hanja
+    }
+}
+
 static STD_OUT_SENDER_GLOBAL: OnceLock<UnboundedSender<String>> = OnceLock::new();
 thread_local! {
     static STD_OUT_SENDER: UnboundedSender<String> = STD_OUT_SENDER_GLOBAL.get().unwrap().clone();
@@ -423,9 +450,46 @@ fn _println_async(line: String) {
     _ = STD_OUT_SENDER.with(|sender| sender.send(line));
 }
 
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Args {
+    /// Input TSV file path
+    #[arg(short, long, short_alias = 'i')]
+    input: String,
+
+    /// Output TSV file path
+    #[arg(short, long, short_alias = 'o')]
+    output: String,
+
+    #[arg(long, default_value_t = 1)]
+    hangul_col: usize,
+
+    #[arg(long, default_value_t = 2)]
+    english_col: usize,
+
+    #[arg(long, default_value_t = -2, )]
+    hanja_col: isize,
+
+    #[arg(long, default_value_t = false)]
+    new_hanja_col: bool,
+}
+
+
 static STDIN_TASK_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let input_file = &args.input;
+    let output_file = &args.output;
+    let hangul_col = args.hangul_col;
+    let hanja_col = args.hanja_col;
+    let english_col = args.english_col;
+    let new_hanja_col = args.new_hanja_col;
+
+
+
+
     let (stdout_sender, stdout_receiver) = mpsc::unbounded_channel::<String>();
     let (stdin_sender, stdin_receiver) = mpsc::channel::<Key>(100);
     let term_access = TokioChannelConsoleAccess {
@@ -453,14 +517,22 @@ async fn main() -> Result<()> {
     });
 
     // Read TSV file and build word pairs.
-    let mut rows = read_tsv_file(INPUT_FILE)?;
-    aprintln!("Read {} rows from {}", rows.len(), INPUT_FILE);
+    let required_columns = max(hangul_col, english_col) + 1;
+    aprintln!("Minimum required columns: {}", required_columns);
+
+    let mut rows = read_tsv_file(input_file, required_columns)?;
+    aprintln!("Read {} rows from {}", rows.len(), input_file);
+
+    // if hanja_col is negative we count from the end of the row
+    aprintln!("data has {} columns, using hanja_col={}", rows[0].len(), hanja_col);
+    let hanja_col = max(0, rows[0].len() as isize + hanja_col) as usize;
+    aprintln!("Using hangul_col={}, english_col={}, hanja_col={}", hangul_col, english_col, hanja_col);
 
     // Create a vector of word pairs from the rows.
     // We assume COLUMN_HANGUL and COLUMN_ENGLISH are present.
     let word_pairs: Vec<(String, String)> = rows
         .iter()
-        .map(|row| (row[COLUMN_HANGUL].clone(), row[COLUMN_ENGLISH].clone()))
+        .map(|row| (row[hangul_col].clone(), row[english_col].clone()))
         .collect();
 
     // Build a reqwest client with middleware that caches responses to "./.cache"
@@ -540,11 +612,23 @@ async fn main() -> Result<()> {
             .get(&i)
             .cloned()
             .unwrap_or(None)
+            .map(|hanja| merge_hanja_hangul(hanja, &row[hangul_col]))
             .unwrap_or_default();
-        row.push(hanja);
+
+/*        //here we need to check if hanja and hangul have the same length ignoring dashes and trimmable whitespaces
+        let hanja = merge_hanja_hangul(hanja, &row[hangul_col]);*/
+
+
+        if hanja_col >= row.len() {
+            row.push(hanja);
+        } else if new_hanja_col {
+            row.insert(hanja_col ,hanja);
+        } else {
+            row[hanja_col] = hanja;
+        }
     }
-    write_tsv_file(OUTPUT_FILE, &rows)?;
-    aprintln!("Wrote output to {}", OUTPUT_FILE);
+    write_tsv_file(output_file, &rows)?;
+    aprintln!("Wrote output to {}", output_file);
 
     // In a real application you would join on all spawned tasks.
     // Here we simply await the aggregator.
